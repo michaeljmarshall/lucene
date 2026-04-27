@@ -66,23 +66,37 @@ public interface VectorScorer {
     if (iterator.docID() == -1) {
       iterator.nextDoc();
     }
-    return (upTo, liveDocs, buffer) -> {
-      assert upTo > 0;
-      buffer.growNoCopy(DEFAULT_BULK_BATCH_SIZE);
-      int size = 0;
-      float maxScore = Float.NEGATIVE_INFINITY;
-      for (int doc = iterator.docID();
-          doc < upTo && size < DEFAULT_BULK_BATCH_SIZE;
-          doc = iterator.nextDoc()) {
-        if (liveDocs == null || liveDocs.get(doc)) {
-          buffer.docs[size] = doc;
-          buffer.features[size] = score();
-          maxScore = Math.max(maxScore, buffer.features[size]);
-          ++size;
+    return new Bulk() {
+      @Override
+      public float nextDocsAndScores(int upTo, Bits liveDocs, DocAndFloatFeatureBuffer buffer)
+          throws IOException {
+        assert upTo > 0;
+        buffer.growNoCopy(DEFAULT_BULK_BATCH_SIZE);
+        int size = 0;
+        float maxScore = Float.NEGATIVE_INFINITY;
+        for (int doc = iterator.docID();
+            doc < upTo && size < DEFAULT_BULK_BATCH_SIZE;
+            doc = iterator.nextDoc()) {
+          if (liveDocs == null || liveDocs.get(doc)) {
+            buffer.docs[size] = doc;
+            buffer.features[size] = score();
+            maxScore = Math.max(maxScore, buffer.features[size]);
+            ++size;
+          }
         }
+        buffer.size = size;
+        return maxScore;
       }
-      buffer.size = size;
-      return maxScore;
+
+      @Override
+      public int advance(int target) throws IOException {
+        return iterator.advance(target);
+      }
+
+      @Override
+      public int docID() {
+        return iterator.docID();
+      }
     };
   }
 
@@ -105,6 +119,23 @@ public interface VectorScorer {
     float nextDocsAndScores(int upTo, Bits liveDocs, DocAndFloatFeatureBuffer buffer)
         throws IOException;
 
+    /**
+     * Advances the internal iterator to the target doc ID. Implementation should match {@link
+     * DocIdSetIterator#advance(int)}.
+     *
+     * @param target the target doc ID to advance to
+     * @return the new doc ID after advancing
+     * @throws IOException if an exception occurs during advancing
+     */
+    int advance(int target) throws IOException;
+
+    /**
+     * Returns the current doc ID of the internal iterator
+     *
+     * @return the current doc ID
+     */
+    int docID();
+
     static Bulk fromRandomScorerDense(
         RandomVectorScorer scorer,
         KnnVectorValues.DocIndexIterator iterator,
@@ -113,22 +144,36 @@ public interface VectorScorer {
           matchingDocs == null
               ? iterator
               : ConjunctionUtils.createConjunction(List.of(matchingDocs, iterator), List.of());
-      return (upTo, liveDocs, buffer) -> {
-        assert upTo > 0;
-        if (matches.docID() == -1) {
-          matches.nextDoc();
-        }
-        buffer.growNoCopy(DEFAULT_BULK_BATCH_SIZE);
-        int size = 0;
-        for (int doc = matches.docID();
-            doc < upTo && size < DEFAULT_BULK_BATCH_SIZE;
-            doc = matches.nextDoc()) {
-          if (liveDocs == null || liveDocs.get(doc)) {
-            buffer.docs[size++] = doc;
+      return new Bulk() {
+        @Override
+        public float nextDocsAndScores(int upTo, Bits liveDocs, DocAndFloatFeatureBuffer buffer)
+            throws IOException {
+          assert upTo > 0;
+          if (matches.docID() == -1) {
+            matches.nextDoc();
           }
+          buffer.growNoCopy(DEFAULT_BULK_BATCH_SIZE);
+          int size = 0;
+          for (int doc = matches.docID();
+              doc < upTo && size < DEFAULT_BULK_BATCH_SIZE;
+              doc = matches.nextDoc()) {
+            if (liveDocs == null || liveDocs.get(doc)) {
+              buffer.docs[size++] = doc;
+            }
+          }
+          buffer.size = size;
+          return scorer.bulkScore(buffer.docs, buffer.features, size);
         }
-        buffer.size = size;
-        return scorer.bulkScore(buffer.docs, buffer.features, size);
+
+        @Override
+        public int advance(int target) throws IOException {
+          return matches.advance(target);
+        }
+
+        @Override
+        public int docID() {
+          return matches.docID();
+        }
       };
     }
 
@@ -167,6 +212,16 @@ public interface VectorScorer {
           // copy back the real doc IDs
           System.arraycopy(docIds, 0, buffer.docs, 0, size);
           return maxScore;
+        }
+
+        @Override
+        public int advance(int target) throws IOException {
+          return matches.advance(target);
+        }
+
+        @Override
+        public int docID() {
+          return matches.docID();
         }
       };
     }
