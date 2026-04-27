@@ -59,30 +59,31 @@ public interface VectorScorer {
    * @lucene.experimental
    */
   default Bulk bulk(DocIdSetIterator matchingDocs) throws IOException {
-    final DocIdSetIterator iterator =
-        matchingDocs == null
-            ? iterator()
-            : ConjunctionUtils.createConjunction(List.of(matchingDocs, iterator()), List.of());
-    if (iterator.docID() == -1) {
-      iterator.nextDoc();
+    final DocIdSetIterator disi = BulkWithIterator.applyMatchingDocs(iterator(), matchingDocs);
+    if (disi.docID() == -1) {
+      disi.nextDoc();
     }
-    return (upTo, liveDocs, buffer) -> {
-      assert upTo > 0;
-      buffer.growNoCopy(DEFAULT_BULK_BATCH_SIZE);
-      int size = 0;
-      float maxScore = Float.NEGATIVE_INFINITY;
-      for (int doc = iterator.docID();
-          doc < upTo && size < DEFAULT_BULK_BATCH_SIZE;
-          doc = iterator.nextDoc()) {
-        if (liveDocs == null || liveDocs.get(doc)) {
-          buffer.docs[size] = doc;
-          buffer.features[size] = score();
-          maxScore = Math.max(maxScore, buffer.features[size]);
-          ++size;
+    return new BulkWithIterator(disi) {
+      @Override
+      public float nextDocsAndScores(int upTo, Bits liveDocs, DocAndFloatFeatureBuffer buffer)
+          throws IOException {
+        assert upTo > 0;
+        buffer.growNoCopy(DEFAULT_BULK_BATCH_SIZE);
+        int size = 0;
+        float maxScore = Float.NEGATIVE_INFINITY;
+        for (int doc = iterator.docID();
+            doc < upTo && size < DEFAULT_BULK_BATCH_SIZE;
+            doc = iterator.nextDoc()) {
+          if (liveDocs == null || liveDocs.get(doc)) {
+            buffer.docs[size] = doc;
+            buffer.features[size] = score();
+            maxScore = Math.max(maxScore, buffer.features[size]);
+            ++size;
+          }
         }
+        buffer.size = size;
+        return maxScore;
       }
-      buffer.size = size;
-      return maxScore;
     };
   }
 
@@ -105,30 +106,47 @@ public interface VectorScorer {
     float nextDocsAndScores(int upTo, Bits liveDocs, DocAndFloatFeatureBuffer buffer)
         throws IOException;
 
+    /**
+     * Advances the internal iterator to the target doc ID
+     *
+     * @param target the target doc ID to advance to
+     * @return the new doc ID after advancing
+     * @throws IOException if an exception occurs during advancing
+     */
+    int advance(int target) throws IOException;
+
+    /**
+     * Returns the current doc ID of the internal iterator
+     *
+     * @return the current doc ID
+     */
+    int docID();
+
     static Bulk fromRandomScorerDense(
         RandomVectorScorer scorer,
         KnnVectorValues.DocIndexIterator iterator,
         DocIdSetIterator matchingDocs) {
-      final DocIdSetIterator matches =
-          matchingDocs == null
-              ? iterator
-              : ConjunctionUtils.createConjunction(List.of(matchingDocs, iterator), List.of());
-      return (upTo, liveDocs, buffer) -> {
-        assert upTo > 0;
-        if (matches.docID() == -1) {
-          matches.nextDoc();
-        }
-        buffer.growNoCopy(DEFAULT_BULK_BATCH_SIZE);
-        int size = 0;
-        for (int doc = matches.docID();
-            doc < upTo && size < DEFAULT_BULK_BATCH_SIZE;
-            doc = matches.nextDoc()) {
-          if (liveDocs == null || liveDocs.get(doc)) {
-            buffer.docs[size++] = doc;
+      final DocIdSetIterator matches = BulkWithIterator.applyMatchingDocs(iterator, matchingDocs);
+      return new BulkWithIterator(matches) {
+        @Override
+        public float nextDocsAndScores(int upTo, Bits liveDocs, DocAndFloatFeatureBuffer buffer)
+            throws IOException {
+          assert upTo > 0;
+          if (iterator.docID() == -1) {
+            iterator.nextDoc();
           }
+          buffer.growNoCopy(DEFAULT_BULK_BATCH_SIZE);
+          int size = 0;
+          for (int doc = iterator.docID();
+              doc < upTo && size < DEFAULT_BULK_BATCH_SIZE;
+              doc = iterator.nextDoc()) {
+            if (liveDocs == null || liveDocs.get(doc)) {
+              buffer.docs[size++] = doc;
+            }
+          }
+          buffer.size = size;
+          return scorer.bulkScore(buffer.docs, buffer.features, size);
         }
-        buffer.size = size;
-        return scorer.bulkScore(buffer.docs, buffer.features, size);
       };
     }
 
@@ -136,28 +154,28 @@ public interface VectorScorer {
         RandomVectorScorer scorer,
         KnnVectorValues.DocIndexIterator iterator,
         DocIdSetIterator matchingDocs) {
-      return new Bulk() {
-        final DocIdSetIterator matches =
-            matchingDocs == null
-                ? iterator
-                : ConjunctionUtils.createConjunction(List.of(matchingDocs, iterator), List.of());
+      final DocIdSetIterator matches = BulkWithIterator.applyMatchingDocs(iterator, matchingDocs);
+      // capture the DocIndexIterator separately: inside the anonymous class, the inherited
+      // `iterator` field refers to `matches`, so we need a distinct reference to call .index()
+      final KnnVectorValues.DocIndexIterator docIndexIter = iterator;
+      return new BulkWithIterator(matches) {
         int[] docIds = new int[0];
 
         @Override
         public float nextDocsAndScores(int upTo, Bits liveDocs, DocAndFloatFeatureBuffer buffer)
             throws IOException {
           assert upTo > 0;
-          if (matches.docID() == -1) {
-            matches.nextDoc();
+          if (iterator.docID() == -1) {
+            iterator.nextDoc();
           }
           buffer.growNoCopy(DEFAULT_BULK_BATCH_SIZE);
           docIds = ArrayUtil.growNoCopy(docIds, DEFAULT_BULK_BATCH_SIZE);
           int size = 0;
-          for (int doc = matches.docID();
+          for (int doc = iterator.docID();
               doc < upTo && size < DEFAULT_BULK_BATCH_SIZE;
-              doc = matches.nextDoc()) {
+              doc = iterator.nextDoc()) {
             if (liveDocs == null || liveDocs.get(doc)) {
-              buffer.docs[size] = iterator.index();
+              buffer.docs[size] = docIndexIter.index();
               docIds[size] = doc;
               ++size;
             }
@@ -170,5 +188,41 @@ public interface VectorScorer {
         }
       };
     }
+  }
+}
+
+/**
+ * Package-private base class for {@link VectorScorer.Bulk} implementations whose {@link
+ * VectorScorer.Bulk#advance} and {@link VectorScorer.Bulk#docID} delegate to a {@link
+ * DocIdSetIterator}. Also provides the shared {@link #applyMatchingDocs} helper used by all three
+ * factory sites.
+ */
+abstract class BulkWithIterator implements VectorScorer.Bulk {
+
+  /** The iterator that drives document traversal for this bulk scorer. */
+  protected final DocIdSetIterator iterator;
+
+  BulkWithIterator(DocIdSetIterator iterator) {
+    this.iterator = iterator;
+  }
+
+  /**
+   * Returns {@code base} when {@code matchingDocs} is null, otherwise a conjunction of both so only
+   * documents present in both iterators are visited.
+   */
+  static DocIdSetIterator applyMatchingDocs(DocIdSetIterator base, DocIdSetIterator matchingDocs) {
+    return matchingDocs == null
+        ? base
+        : ConjunctionUtils.createConjunction(List.of(matchingDocs, base), List.of());
+  }
+
+  @Override
+  public final int advance(int target) throws IOException {
+    return iterator.advance(target);
+  }
+
+  @Override
+  public final int docID() {
+    return iterator.docID();
   }
 }
