@@ -1,0 +1,13 @@
+2713
+Model name:                              Intel(R) Xeon(R) CPU @ 2.80GHz
+Thread(s) per core:                      2
+Core(s) per socket:                      8
+Socket(s):                               1
+6.8.0-1060-gcp
+               total        used        free      shared  buff/cache   available
+Mem:              31           0          26           0           4          30
+NAME      SIZE MODEL
+sda       100G PersistentDisk
+nvme0n1   375G nvme_card
+nvme0n2   375G nvme_card
+256
